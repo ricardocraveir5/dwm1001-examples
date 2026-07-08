@@ -7,18 +7,14 @@
 *           This version:
 *           - Keeps the original Decawave SS TWR responder behaviour.
 *           - Uses SEGGER RTT instead of printf/stdout.
-*           - Prints every received UWB frame.
-*           - Detects possible Bitcraze/Loco TWR POLL frames.
-*           - Detects original Decawave POLL frames.
-*
-*           IMPORTANT:
-*           This is still mainly the Decawave responder.
-*           The Bitcraze/Loco POLL detection is for diagnosis only.
-*           It does NOT yet implement the full Bitcraze-compatible:
+*           - Prints every received UWB frame that is not handled.
+*           - Implements the full Bitcraze/Loco TWR anchor cycle:
 *
 *               POLL -> ANSWER -> FINAL -> REPORT
 *
-*           cycle.
+*           The anchor is passive: it only captures 40-bit hardware
+*           timestamps (poll RX, answer TX, final RX) and returns them in
+*           the REPORT payload. Distance is computed on the Crazyflie.
 *
 * @attention
 *
@@ -29,6 +25,7 @@
 
 #include "sdk_config.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include "FreeRTOS.h"
@@ -49,8 +46,14 @@
  */
 #define DBG(...) SEGGER_RTT_printf(0, __VA_ARGS__)
 
-/* Inter-ranging delay period, in milliseconds. */
-#define RNG_DELAY_MS 80
+/*
+ * Inter-ranging delay period, in milliseconds.
+ *
+ * The LP deck polls anchors in a fast round-robin. With the original 80 ms
+ * pause between ss_resp_run() calls the anchor would be deaf between
+ * exchanges and miss most POLLs, so we only yield for one tick.
+ */
+#define RNG_DELAY_MS 1
 
 /* ----------------------------------------------------------------------------
  * Original Decawave SS TWR frames
@@ -136,6 +139,52 @@ static uint8 tx_resp_msg[] = {
 #define BC_MIN_FRAME_LEN        23
 #define BC_EXPECTED_FCF         0xDC41
 
+#define BC_HEADER_LEN           21
+
+/* CRC appended automatically by the DW1000. */
+#define BC_CRC_LEN              2
+
+/*
+ * Bitcraze/Loco TWR timing.
+ *
+ * Delays from the HW RX timestamp of the incoming frame to the scheduled HW
+ * TX time of the reply, in UWB microseconds. 1100 uus is the value already
+ * proven safe for nRF/DWM1001 delayed TX in this project.
+ */
+#define POLL_RX_TO_ANSWER_TX_DLY_UUS   1100
+#define FINAL_RX_TO_REPORT_TX_DLY_UUS  1100
+
+/*
+ * RX timeout while waiting for the FINAL after our ANSWER, in UWB
+ * microseconds. Not specified by the Bitcraze protocol; 5000 uus is a wide
+ * margin over the tag turnaround and may be tuned on the bench.
+ */
+#define FINAL_RX_TIMEOUT_UUS           5000
+
+/*
+ * Frames not addressed to us can appear between our ANSWER and the FINAL
+ * (the deck polls anchor IDs 0-7 in round-robin). Discard at most this many
+ * before giving up on the current exchange.
+ */
+#define BC_FINAL_MAX_DISCARDS          4
+
+/*
+ * REPORT payload, starting at payload byte 2 (after type + seq).
+ * Must match lpsTwrTagReportPayload_t in bitcraze/crazyflie-firmware.
+ */
+typedef struct {
+    uint8_t pollRx[5];    /* 40-bit timestamp */
+    uint8_t answerTx[5];  /* 40-bit timestamp */
+    uint8_t finalRx[5];   /* 40-bit timestamp */
+    float   pressure;     /* 0.0f (no barometer) */
+    float   asl;          /* 0.0f */
+    uint8_t pressure_ok;  /* 0 */
+} __attribute__((packed)) lpsTwrTagReportPayload_t;
+
+#define BC_ANSWER_FRAME_LEN  (BC_HEADER_LEN + 2 + BC_CRC_LEN)
+#define BC_REPORT_FRAME_LEN  (BC_HEADER_LEN + 2 + \
+                              sizeof(lpsTwrTagReportPayload_t) + BC_CRC_LEN)
+
 /* ----------------------------------------------------------------------------
  * Common variables
  * ----------------------------------------------------------------------------
@@ -182,6 +231,14 @@ typedef unsigned long long uint64;
 static uint64 poll_rx_ts;
 static uint64 resp_tx_ts;
 
+/* Bitcraze/Loco TWR exchange timestamps. */
+static uint64 bc_poll_rx_ts;
+static uint64 bc_answer_tx_ts;
+static uint64 bc_final_rx_ts;
+
+/* TX buffer for Bitcraze/Loco frames (ANSWER and REPORT). */
+static uint8 bc_tx_frame[BC_REPORT_FRAME_LEN];
+
 /* ----------------------------------------------------------------------------
  * Static function declarations
  * ----------------------------------------------------------------------------
@@ -192,9 +249,16 @@ static void resp_msg_set_ts(uint8 *ts_field, const uint64 ts);
 
 static uint16 read_u16_le(const uint8 *buf);
 static uint64 read_u64_le(const uint8 *buf);
+static void write_u64_le(uint8 *buf, uint64 value);
+static void ts_to_bytes40(uint8 *dst, uint64 ts);
 
 static void print_rx_frame_debug(const uint8 *buf, uint32 frame_len);
 static int is_bitcraze_loco_poll(const uint8 *buf, uint32 frame_len);
+static int is_bitcraze_frame_for_me(const uint8 *buf, uint32 frame_len,
+                                    uint8 type, uint8 seq);
+
+static void bc_build_header(uint8 *buf, uint8 mac_seq);
+static void bc_handle_twr_poll(void);
 
 /* ----------------------------------------------------------------------------
  * Main responder function
@@ -246,38 +310,25 @@ int ss_resp_run(void)
       dwt_readrxdata(rx_buffer, frame_len, 0);
 
       /*
+       * Bitcraze/Loco TWR POLL addressed to this anchor: run the whole
+       * ANSWER -> FINAL -> REPORT exchange now. The ANSWER TX window is
+       * only POLL_RX_TO_ANSWER_TX_DLY_UUS wide, so no logging may happen
+       * before the exchange is scheduled inside bc_handle_twr_poll().
+       */
+      if (is_bitcraze_loco_poll(rx_buffer, frame_len))
+      {
+        bc_handle_twr_poll();
+        return 1;
+      }
+
+      /*
        * LASIR DEBUG:
-       * Print every valid UWB frame that reaches the DW1000.
+       * Print every valid UWB frame that is not a Bitcraze POLL for us.
        *
        * If this never appears in RTT Viewer, then the DWM1001 is not receiving
        * any decodable UWB frame with the current PHY configuration.
        */
       print_rx_frame_debug(rx_buffer, frame_len);
-
-      /*
-       * LASIR DEBUG:
-       * Check whether this frame looks like a Bitcraze/Loco TWR POLL
-       * addressed to this anchor.
-       */
-      if (is_bitcraze_loco_poll(rx_buffer, frame_len))
-      {
-        uint8 lps_seq;
-
-        lps_seq = rx_buffer[BC_PAYLOAD_IDX + LPS_TWR_SEQ];
-
-        DBG("POLL recebido BITCRAZE, anchor=%u, seq=%u\r\n",
-            (unsigned int)ANCHOR_ID,
-            (unsigned int)lps_seq);
-
-        /*
-         * IMPORTANT:
-         * At this stage we only detect the Bitcraze POLL.
-         *
-         * Full Bitcraze-compatible response must be implemented next:
-         *
-         *   POLL -> ANSWER -> FINAL -> REPORT
-         */
-      }
     }
     else
     {
@@ -477,6 +528,30 @@ static uint64 read_u64_le(const uint8 *buf)
   return value;
 }
 
+static void write_u64_le(uint8 *buf, uint64 value)
+{
+  int i;
+
+  for (i = 0; i < 8; i++)
+  {
+    buf[i] = (uint8)(value >> (i * 8));
+  }
+}
+
+/*
+ * Write a 40-bit DW1000 timestamp as 5 bytes, least significant byte first.
+ * Note: resp_msg_set_ts() only writes 4 bytes and cannot be reused here.
+ */
+static void ts_to_bytes40(uint8 *dst, uint64 ts)
+{
+  int i;
+
+  for (i = 0; i < 5; i++)
+  {
+    dst[i] = (uint8)(ts >> (i * 8));
+  }
+}
+
 static void print_rx_frame_debug(const uint8 *buf, uint32 frame_len)
 {
   /*
@@ -565,6 +640,280 @@ static int is_bitcraze_loco_poll(const uint8 *buf, uint32 frame_len)
   return 1;
 }
 
+/*
+ * Check that a frame is a Bitcraze/Loco frame of the given type and payload
+ * sequence number, sent by the tag to this anchor. Used to match the FINAL
+ * to the POLL currently being served.
+ */
+static int is_bitcraze_frame_for_me(const uint8 *buf, uint32 frame_len,
+                                    uint8 type, uint8 seq)
+{
+  if (frame_len < BC_MIN_FRAME_LEN)
+  {
+    return 0;
+  }
+
+  if (read_u16_le(&buf[BC_FCF_IDX]) != BC_EXPECTED_FCF)
+  {
+    return 0;
+  }
+
+  if (read_u16_le(&buf[BC_PAN_IDX]) != PAN_ID)
+  {
+    return 0;
+  }
+
+  if (read_u64_le(&buf[BC_DEST_ADDR_IDX]) != MY_ADDRESS)
+  {
+    return 0;
+  }
+
+  if (read_u64_le(&buf[BC_SRC_ADDR_IDX]) != TAG_ADDRESS)
+  {
+    return 0;
+  }
+
+  if (buf[BC_PAYLOAD_IDX + LPS_TWR_TYPE] != type)
+  {
+    return 0;
+  }
+
+  if (buf[BC_PAYLOAD_IDX + LPS_TWR_SEQ] != seq)
+  {
+    return 0;
+  }
+
+  return 1;
+}
+
+/* ----------------------------------------------------------------------------
+ * Bitcraze/Loco TWR anchor exchange
+ * ----------------------------------------------------------------------------
+ */
+
+/*
+ * Write the 21-byte IEEE 802.15.4 header used by the Bitcraze/Loco frames:
+ * FCF 0xDC41 (data frame, PAN compression, 64-bit dest + src addresses),
+ * destination = tag, source = this anchor.
+ */
+static void bc_build_header(uint8 *buf, uint8 mac_seq)
+{
+  buf[BC_FCF_IDX]     = 0x41;
+  buf[BC_FCF_IDX + 1] = 0xDC;
+  buf[BC_SEQ_IDX]     = mac_seq;
+  buf[BC_PAN_IDX]     = (uint8)(PAN_ID & 0xFF);
+  buf[BC_PAN_IDX + 1] = (uint8)(PAN_ID >> 8);
+
+  write_u64_le(&buf[BC_DEST_ADDR_IDX], TAG_ADDRESS);
+  write_u64_le(&buf[BC_SRC_ADDR_IDX], MY_ADDRESS);
+}
+
+/*
+ * Serve one full TWR exchange after a valid POLL has been received into
+ * rx_buffer:
+ *
+ *   POLL (already in rx_buffer) -> ANSWER -> FINAL -> REPORT
+ *
+ * The anchor only timestamps; the tag computes the distance from the three
+ * timestamps returned in the REPORT.
+ *
+ * Timing note: the ANSWER must go on air POLL_RX_TO_ANSWER_TX_DLY_UUS after
+ * the POLL RX timestamp, so everything up to dwt_starttx() is time critical
+ * and must not be interleaved with RTT logging.
+ */
+static void bc_handle_twr_poll(void)
+{
+  uint8 lps_seq;
+  uint32 answer_tx_time;
+  uint32 report_tx_time;
+  uint32 frame_len;
+  int discards;
+  int ret;
+  lpsTwrTagReportPayload_t report;
+
+  lps_seq = rx_buffer[BC_PAYLOAD_IDX + LPS_TWR_SEQ];
+
+  /* --------------------------------------------------------------------
+   * ANSWER — time critical section (no logging until dwt_starttx()).
+   * --------------------------------------------------------------------
+   */
+  bc_poll_rx_ts = get_rx_timestamp_u64();
+
+  answer_tx_time =
+      (uint32)((bc_poll_rx_ts +
+               (POLL_RX_TO_ANSWER_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
+
+  dwt_setdelayedtrxtime(answer_tx_time);
+
+  /*
+   * ANSWER TX timestamp = programmed time (LSB masked, as the DW1000
+   * ignores it) shifted back, plus the antenna delay. Same pattern as the
+   * original single-sided example.
+   */
+  bc_answer_tx_ts =
+      (((uint64)(answer_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+
+  bc_build_header(bc_tx_frame, frame_seq_nb);
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_ANSWER;
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
+
+  dwt_writetxdata(BC_ANSWER_FRAME_LEN, bc_tx_frame, 0);
+  dwt_writetxfctrl(BC_ANSWER_FRAME_LEN, 0, 1);
+
+  /*
+   * Re-arm the receiver in hardware right after the ANSWER so the FINAL is
+   * caught, with a timeout so a lost FINAL cannot block the anchor.
+   */
+  dwt_setrxaftertxdelay(0);
+  dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
+
+  ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+
+  if (ret != DWT_SUCCESS)
+  {
+    /*
+     * The ANSWER TX window was missed (e.g. delayed by logging or the
+     * scheduler). Abandon this exchange and go back to waiting for POLLs.
+     */
+    DBG("ERRO: ANSWER dwt_starttx falhou, seq=%u\r\n", (unsigned int)lps_seq);
+
+    dwt_forcetrxoff();
+    dwt_rxreset();
+    dwt_setrxtimeout(0);
+    return;
+  }
+
+  /* Poll DW1000 until the ANSWER is on air. */
+  while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS))
+  {
+  }
+
+  dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+
+  DBG("ANSWER enviado, anchor=%u, seq=%u\r\n",
+      (unsigned int)ANCHOR_ID,
+      (unsigned int)lps_seq);
+
+  /* --------------------------------------------------------------------
+   * FINAL — wait for the tag's FINAL for this exchange.
+   *
+   * Frames for other anchor IDs may arrive in between (round-robin);
+   * discard them and re-arm RX, bounded by BC_FINAL_MAX_DISCARDS.
+   * --------------------------------------------------------------------
+   */
+  discards = 0;
+
+  for (;;)
+  {
+    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
+             (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)))
+    {
+    }
+
+    if (!(status_reg & SYS_STATUS_RXFCG))
+    {
+      /* Timeout or RX error: abandon this exchange without blocking. */
+      dwt_write32bitreg(SYS_STATUS_ID,
+                        SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+      dwt_rxreset();
+      dwt_setrxtimeout(0);
+
+      DBG("FINAL timeout/erro, seq=%u, status=%08X\r\n",
+          (unsigned int)lps_seq,
+          (unsigned int)status_reg);
+      return;
+    }
+
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+
+    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
+
+    if (frame_len <= RX_BUF_LEN)
+    {
+      dwt_readrxdata(rx_buffer, frame_len, 0);
+
+      if (is_bitcraze_frame_for_me(rx_buffer, frame_len,
+                                   LPS_TWR_FINAL, lps_seq))
+      {
+        break;
+      }
+    }
+
+    /* Not our FINAL: discard and keep listening, bounded. */
+    discards++;
+
+    if (discards > BC_FINAL_MAX_DISCARDS)
+    {
+      dwt_rxreset();
+      dwt_setrxtimeout(0);
+
+      DBG("FINAL nao chegou (%d frames descartadas), seq=%u\r\n",
+          discards,
+          (unsigned int)lps_seq);
+      return;
+    }
+
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+  }
+
+  /* --------------------------------------------------------------------
+   * REPORT — time critical section (no logging until dwt_starttx()).
+   * --------------------------------------------------------------------
+   */
+  bc_final_rx_ts = get_rx_timestamp_u64();
+
+  report_tx_time =
+      (uint32)((bc_final_rx_ts +
+               (FINAL_RX_TO_REPORT_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
+
+  dwt_setdelayedtrxtime(report_tx_time);
+
+  memset(&report, 0, sizeof(report));
+  ts_to_bytes40(report.pollRx, bc_poll_rx_ts);
+  ts_to_bytes40(report.answerTx, bc_answer_tx_ts);
+  ts_to_bytes40(report.finalRx, bc_final_rx_ts);
+  report.pressure = 0.0f;
+  report.asl = 0.0f;
+  report.pressure_ok = 0;
+
+  bc_build_header(bc_tx_frame, frame_seq_nb);
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_REPORT;
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
+  memcpy(&bc_tx_frame[BC_PAYLOAD_IDX + 2], &report, sizeof(report));
+
+  dwt_writetxdata(BC_REPORT_FRAME_LEN, bc_tx_frame, 0);
+  dwt_writetxfctrl(BC_REPORT_FRAME_LEN, 0, 1);
+
+  ret = dwt_starttx(DWT_START_TX_DELAYED);
+
+  DBG("FINAL recebido, seq=%u\r\n", (unsigned int)lps_seq);
+
+  if (ret != DWT_SUCCESS)
+  {
+    DBG("ERRO: REPORT dwt_starttx falhou, seq=%u\r\n", (unsigned int)lps_seq);
+
+    dwt_forcetrxoff();
+    dwt_rxreset();
+    dwt_setrxtimeout(0);
+    return;
+  }
+
+  while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS))
+  {
+  }
+
+  dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+
+  DBG("REPORT enviado, anchor=%u, seq=%u\r\n",
+      (unsigned int)ANCHOR_ID,
+      (unsigned int)lps_seq);
+
+  frame_seq_nb++;
+
+  /* Back to waiting for POLLs with no RX timeout. */
+  dwt_setrxtimeout(0);
+}
+
 /* ----------------------------------------------------------------------------
  * FreeRTOS task
  * ----------------------------------------------------------------------------
@@ -618,21 +967,24 @@ void ss_responder_task_function(void * pvParameter)
 *
 *    If this appears, the DW1000 is receiving decodable UWB frames.
 *
-* 2. Added Bitcraze/Loco POLL detection:
+* 2. Implemented the Bitcraze/Loco TWR anchor exchange
+*    (POLL -> ANSWER -> FINAL -> REPORT) in bc_handle_twr_poll().
+*    RTT shows one line per state transition:
 *
-*      POLL recebido BITCRAZE...
+*      ANSWER enviado...
+*      FINAL recebido...   (or FINAL timeout/erro...)
+*      REPORT enviado...
 *
-*    If this appears, the LP deck is transmitting and the DWM1001 can decode
-*    the frame with the current PHY and addressing assumptions.
+*    The anchor never computes distance; it returns the three 40-bit HW
+*    timestamps (poll RX, answer TX, final RX) in the REPORT payload and the
+*    Crazyflie does the math. Antenna delays are the uncalibrated defaults
+*    from port_platform.h (calibration is a later phase).
 *
-* 3. Added original Decawave POLL detection:
+* 3. Kept the original Decawave POLL detection and response:
 *
 *      POLL recebido DECAWAVE...
 *
 *    If this appears while using another DWM1001 with ss_twr_init, the original
 *    Decawave ranging example is working.
-*
-* 4. This file does not yet send a Bitcraze-compatible ANSWER/REPORT.
-*    That is the next implementation step after confirming POLL reception.
 *
 ****************************************************************************************************************************************************/
