@@ -39,10 +39,20 @@ verificado com o setup real.
 4. No RTT, procurar por troca completa com o **mesmo seq** nas três linhas:
 
    ```
-   ANSWER enviado, anchor=1, seq=N
+   ANSWER enviado, anchor=0, seq=N
    FINAL recebido, seq=N
-   REPORT enviado, anchor=1, seq=N
+   REPORT enviado, anchor=0, seq=N
    ```
+
+   Uma troca falhada imprime agora um bloco de diagnóstico:
+
+   ```
+   FINAL falhou (<motivo>), seq=N, status=XXXXXXXX, descartadas=D, reinicios=R
+     dsc[0]: st=XXXXXXXX len=25 fcf=DC41 mseq=M dst=08 src=00 type=03 pseq=N
+   ```
+
+   A interpretação campo a campo está em `DIAG_F3.md` §4 — é essa tabela
+   que discrimina a causa raiz na próxima sessão.
 
 5. No cfclient → tab **Loco Positioning**: o anchor com o `ANCHOR_ID`
    flashado deve aparecer com **distância ≠ 0 que varia** quando o drone se
@@ -60,7 +70,7 @@ um offset constante de talvez alguns metros.
 |---|---|---|
 | Nada recebido (`RX len=` nunca aparece) | PHY/hardware (regressão — isto estava validado) | Reflashar, verificar deck |
 | `ERRO: ANSWER dwt_starttx falhou` | Janela de 1100 uus estourada | Ver se há logs antes do agendamento; como último recurso subir `POLL_RX_TO_ANSWER_TX_DLY_UUS` (mas o deck valida este timing do lado dele) |
-| `ANSWER enviado` mas sempre `FINAL timeout/erro` | Deck rejeitou o ANSWER (FCF/endereços/seq) ou timeout curto | Confirmar bytes do ANSWER com sniffer; experimentar subir `FINAL_RX_TIMEOUT_UUS` |
+| `ANSWER enviado` mas sempre `FINAL falhou (...)` | Ver o bloco de diagnóstico | Aplicar a tabela de leitura do `DIAG_F3.md` §4 (frames descartados dizem se o FINAL está a ser rejeitado ou nunca chega) |
 | Troca completa no RTT mas distância nunca aparece no cfclient | Payload do REPORT (layout/endianness dos timestamps) | Comparar com `lpsTwrTagReportPayload_t` em `lpsTwrTag.h` da bitcraze |
 | Distância aparece mas fixa/absurda | Timestamps trocados ou `answerTx` mal calculado | Verificar ordem pollRx/answerTx/finalRx no payload |
 
