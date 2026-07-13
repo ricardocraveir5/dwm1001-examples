@@ -300,7 +300,7 @@ static void bc_handle_twr_poll(void);
 
 static void bc_diag_capture(uint32 status, uint32 frame_len, const uint8 *buf);
 static void bc_diag_dump(const char *reason, uint8 seq, uint32 last_status,
-                         int discards, int restarts);
+                         int discards, int own_polls_ignored);
 
 /* ----------------------------------------------------------------------------
  * Main responder function
@@ -787,16 +787,16 @@ static void bc_diag_capture(uint32 status, uint32 frame_len, const uint8 *buf)
  * traffic to other anchors (dst!=us, type=01).
  */
 static void bc_diag_dump(const char *reason, uint8 seq, uint32 last_status,
-                         int discards, int restarts)
+                         int discards, int own_polls_ignored)
 {
   int i;
 
-  DBG("FINAL falhou (%s), seq=%u, status=%08X, descartadas=%d, reinicios=%d\r\n",
+  DBG("FINAL falhou (%s), seq=%u, status=%08X, descartadas=%d, polls_ignorados=%d\r\n",
       reason,
       (unsigned int)seq,
       (unsigned int)last_status,
       discards,
-      restarts);
+      own_polls_ignored);
 
   if (bc_diag_dumps_left <= 0)
   {
@@ -832,6 +832,11 @@ static void bc_diag_dump(const char *reason, uint8 seq, uint32 last_status,
  * The anchor only timestamps; the tag computes the distance from the three
  * timestamps returned in the REPORT.
  *
+ * One call serves exactly one exchange and always ends in a logged outcome:
+ * "FINAL recebido" or "FINAL falhou". A fresh POLL for this anchor arriving
+ * while the FINAL is pending is ignored (counted in polls_ignorados), never
+ * served, so exchanges cannot overlap and no outcome is ever swallowed.
+ *
  * Timing note: the ANSWER must go on air POLL_RX_TO_ANSWER_TX_DLY_UUS after
  * the POLL RX timestamp, so everything up to dwt_starttx() is time critical
  * and must not be interleaved with RTT logging.
@@ -844,191 +849,171 @@ static void bc_handle_twr_poll(void)
   uint32 final_deadline;
   uint32 frame_len;
   int discards;
-  int restarts;
-  int restart;
+  int own_polls_ignored;
   int ret;
   lpsTwrTagReportPayload_t report;
 
   bc_diag_count = 0;
   discards = 0;
-  restarts = 0;
+  own_polls_ignored = 0;
+
+  lps_seq = rx_buffer[BC_PAYLOAD_IDX + LPS_TWR_SEQ];
+
+  /* --------------------------------------------------------------------
+   * ANSWER — time critical section (no logging until dwt_starttx()).
+   * --------------------------------------------------------------------
+   */
+  bc_poll_rx_ts = get_rx_timestamp_u64();
+
+  answer_tx_time =
+      (uint32)((bc_poll_rx_ts +
+               (POLL_RX_TO_ANSWER_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
+
+  dwt_setdelayedtrxtime(answer_tx_time);
 
   /*
-   * Exchange loop: a fresh POLL for this anchor arriving while we wait for
-   * a FINAL means the tag gave up on the old exchange — restart with the
-   * new POLL immediately (its RX timestamp was just captured, the ANSWER
-   * window is intact).
+   * ANSWER TX timestamp = programmed time (LSB masked, as the DW1000
+   * ignores it) shifted back, plus the antenna delay. Same pattern as the
+   * original single-sided example.
+   */
+  bc_answer_tx_ts =
+      (((uint64)(answer_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+
+  bc_build_header(bc_tx_frame, frame_seq_nb);
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_ANSWER;
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
+
+  dwt_writetxdata(BC_ANSWER_FRAME_LEN, bc_tx_frame, 0);
+  dwt_writetxfctrl(BC_ANSWER_FRAME_LEN, 0, 1);
+
+  /*
+   * Re-arm the receiver in hardware right after the ANSWER so the FINAL
+   * is caught, with a timeout so a lost FINAL cannot block the anchor.
+   */
+  dwt_setrxaftertxdelay(0);
+  dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
+
+  ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+
+  if (ret != DWT_SUCCESS)
+  {
+    /*
+     * The ANSWER TX window was missed (e.g. delayed by logging or the
+     * scheduler). Abandon this exchange and go back to waiting for POLLs.
+     */
+    DBG("ERRO: ANSWER dwt_starttx falhou, seq=%u\r\n",
+        (unsigned int)lps_seq);
+
+    dwt_forcetrxoff();
+    dwt_rxreset();
+    dwt_setrxtimeout(0);
+    return;
+  }
+
+  /*
+   * Absolute deadline for the FINAL, in the same >>8 units used by
+   * dwt_setdelayedtrxtime() and dwt_readsystimestamphi32(). Each
+   * discarded frame restarts the per-rxenable HW timeout, so this is
+   * what actually bounds the wait in time.
+   */
+  final_deadline = answer_tx_time +
+      (uint32)((FINAL_RX_TOTAL_WINDOW_UUS * UUS_TO_DWT_TIME) >> 8);
+
+  /* Poll DW1000 until the ANSWER is on air. */
+  while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS))
+  {
+  }
+
+  /*
+   * Clear ALL TX event bits, not just TXFRS: leftover TXFRB/TXPRS/TXPHS
+   * would pollute every SYS_STATUS captured during the FINAL wait.
+   */
+  dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX);
+
+  DBG("ANSWER enviado, anchor=%u, seq=%u\r\n",
+      (unsigned int)ANCHOR_ID,
+      (unsigned int)lps_seq);
+
+  /* --------------------------------------------------------------------
+   * FINAL — wait for the tag's FINAL for this exchange.
+   * --------------------------------------------------------------------
    */
   for (;;)
   {
-    lps_seq = rx_buffer[BC_PAYLOAD_IDX + LPS_TWR_SEQ];
-
-    /* ------------------------------------------------------------------
-     * ANSWER — time critical section (no logging until dwt_starttx()).
-     * ------------------------------------------------------------------
-     */
-    bc_poll_rx_ts = get_rx_timestamp_u64();
-
-    answer_tx_time =
-        (uint32)((bc_poll_rx_ts +
-                 (POLL_RX_TO_ANSWER_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
-
-    dwt_setdelayedtrxtime(answer_tx_time);
-
-    /*
-     * ANSWER TX timestamp = programmed time (LSB masked, as the DW1000
-     * ignores it) shifted back, plus the antenna delay. Same pattern as the
-     * original single-sided example.
-     */
-    bc_answer_tx_ts =
-        (((uint64)(answer_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
-
-    bc_build_header(bc_tx_frame, frame_seq_nb);
-    bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_ANSWER;
-    bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
-
-    dwt_writetxdata(BC_ANSWER_FRAME_LEN, bc_tx_frame, 0);
-    dwt_writetxfctrl(BC_ANSWER_FRAME_LEN, 0, 1);
-
-    /*
-     * Re-arm the receiver in hardware right after the ANSWER so the FINAL
-     * is caught, with a timeout so a lost FINAL cannot block the anchor.
-     */
-    dwt_setrxaftertxdelay(0);
-    dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
-
-    ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
-
-    if (ret != DWT_SUCCESS)
+    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
+             (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)))
     {
-      /*
-       * The ANSWER TX window was missed (e.g. delayed by logging or the
-       * scheduler). Abandon this exchange and go back to waiting for POLLs.
-       */
-      DBG("ERRO: ANSWER dwt_starttx falhou, seq=%u\r\n",
-          (unsigned int)lps_seq);
+    }
 
-      dwt_forcetrxoff();
+    if (!(status_reg & SYS_STATUS_RXFCG))
+    {
+      /* HW timeout or RX error: abandon this exchange without blocking. */
+      dwt_write32bitreg(SYS_STATUS_ID,
+                        SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
       dwt_rxreset();
       dwt_setrxtimeout(0);
+
+      bc_diag_dump("timeout/erro RX", lps_seq, status_reg,
+                   discards, own_polls_ignored);
       return;
     }
 
     /*
-     * Absolute deadline for the FINAL, in the same >>8 units used by
-     * dwt_setdelayedtrxtime() and dwt_readsystimestamphi32(). Each
-     * discarded frame restarts the per-rxenable HW timeout, so this is
-     * what actually bounds the wait in time.
+     * Clear every good-RX event bit (not just RXFCG) so the status
+     * captured for the next event reflects that event only.
      */
-    final_deadline = answer_tx_time +
-        (uint32)((FINAL_RX_TOTAL_WINDOW_UUS * UUS_TO_DWT_TIME) >> 8);
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD);
 
-    /* Poll DW1000 until the ANSWER is on air. */
-    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS))
+    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
+
+    if (frame_len <= RX_BUF_LEN)
     {
+      dwt_readrxdata(rx_buffer, frame_len, 0);
+
+      if (is_bitcraze_frame_for_me(rx_buffer, frame_len,
+                                   LPS_TWR_FINAL, lps_seq))
+      {
+        break;
+      }
+
+      if (is_bitcraze_loco_poll(rx_buffer, frame_len))
+      {
+        /*
+         * Fresh POLL for this anchor while the FINAL for lps_seq is still
+         * pending. Serving it would overlap two exchanges and swallow this
+         * cycle's outcome (the reinicios=1 race), so it is only counted
+         * and then discarded below like any other frame. The current
+         * exchange always runs to a logged end first.
+         */
+        own_polls_ignored++;
+      }
+
+      bc_diag_capture(status_reg, frame_len, rx_buffer);
+    }
+    else
+    {
+      bc_diag_capture(status_reg, frame_len, NULL);
     }
 
-    /*
-     * Clear ALL TX event bits, not just TXFRS: leftover TXFRB/TXPRS/TXPHS
-     * would pollute every SYS_STATUS captured during the FINAL wait.
-     */
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX);
+    discards++;
 
-    DBG("ANSWER enviado, anchor=%u, seq=%u\r\n",
-        (unsigned int)ANCHOR_ID,
-        (unsigned int)lps_seq);
-
-    /* ------------------------------------------------------------------
-     * FINAL — wait for the tag's FINAL for this exchange.
-     * ------------------------------------------------------------------
-     */
-    restart = 0;
-
-    for (;;)
+    if ((int32_t)(dwt_readsystimestamphi32() - final_deadline) > 0)
     {
-      while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
-               (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)))
-      {
-      }
-
-      if (!(status_reg & SYS_STATUS_RXFCG))
-      {
-        /* HW timeout or RX error: abandon this exchange without blocking. */
-        dwt_write32bitreg(SYS_STATUS_ID,
-                          SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-        dwt_rxreset();
-        dwt_setrxtimeout(0);
-
-        bc_diag_dump("timeout/erro RX", lps_seq, status_reg,
-                     discards, restarts);
-        return;
-      }
-
-      /*
-       * Clear every good-RX event bit (not just RXFCG) so the status
-       * captured for the next event reflects that event only.
-       */
-      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD);
-
-      frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
-
-      if (frame_len <= RX_BUF_LEN)
-      {
-        dwt_readrxdata(rx_buffer, frame_len, 0);
-
-        if (is_bitcraze_frame_for_me(rx_buffer, frame_len,
-                                     LPS_TWR_FINAL, lps_seq))
-        {
-          break;
-        }
-
-        if (is_bitcraze_loco_poll(rx_buffer, frame_len))
-        {
-          /*
-           * Fresh POLL for this anchor: serve it right away. No logging
-           * here — the new ANSWER window is already running. The restart
-           * shows up in the reinicios counter of a later dump.
-           */
-          restarts++;
-          restart = 1;
-          break;
-        }
-
-        bc_diag_capture(status_reg, frame_len, rx_buffer);
-      }
-      else
-      {
-        bc_diag_capture(status_reg, frame_len, NULL);
-      }
-
-      discards++;
-
-      if ((int32_t)(dwt_readsystimestamphi32() - final_deadline) > 0)
-      {
-        dwt_setrxtimeout(0);
-        bc_diag_dump("janela esgotada", lps_seq, status_reg,
-                     discards, restarts);
-        return;
-      }
-
-      if (discards > BC_FINAL_MAX_DISCARDS)
-      {
-        dwt_setrxtimeout(0);
-        bc_diag_dump("valvula de descartes", lps_seq, status_reg,
-                     discards, restarts);
-        return;
-      }
-
-      dwt_rxenable(DWT_START_RX_IMMEDIATE);
+      dwt_setrxtimeout(0);
+      bc_diag_dump("janela esgotada", lps_seq, status_reg,
+                   discards, own_polls_ignored);
+      return;
     }
 
-    if (restart)
+    if (discards > BC_FINAL_MAX_DISCARDS)
     {
-      continue;
+      dwt_setrxtimeout(0);
+      bc_diag_dump("valvula de descartes", lps_seq, status_reg,
+                   discards, own_polls_ignored);
+      return;
     }
 
-    /* FINAL received and validated. */
-    break;
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
   }
 
   /* --------------------------------------------------------------------
@@ -1083,9 +1068,10 @@ static void bc_handle_twr_poll(void)
       (unsigned int)ANCHOR_ID,
       (unsigned int)lps_seq);
 
-  if (discards > 0 || restarts > 0)
+  if (discards > 0 || own_polls_ignored > 0)
   {
-    DBG("  (troca com %d descartes, %d reinicios)\r\n", discards, restarts);
+    DBG("  (troca com %d descartes, %d polls ignorados)\r\n",
+        discards, own_polls_ignored);
   }
 
   frame_seq_nb++;

@@ -79,7 +79,8 @@ seq do POLL). Duas hipóteses compatíveis com a evidência:
 Nota sobre (b): um POLL novo *para nós* durante a espera era descartado e
 desperdiçado — a troca nova morria também. O patch passa a reiniciar a
 troca imediatamente nesse caso (o timestamp de RX está fresco e a janela de
-1100 uus intacta).
+1100 uus intacta). **[REVERTIDO — ver §6: este reinício era uma race
+condition que engolia o outcome do ciclo interrompido.]**
 
 Não é possível decidir (a) vs (b) sem os bytes dos frames descartados —
 por isso o entregável é instrumentação, não um fix especulativo.
@@ -90,7 +91,7 @@ Falha de troca produz um bloco único (impresso *depois* de a troca morrer,
 nunca dentro das janelas de timing):
 
 ```
-FINAL falhou (<motivo>), seq=N, status=XXXXXXXX, descartadas=D, reinicios=R
+FINAL falhou (<motivo>), seq=N, status=XXXXXXXX, descartadas=D, polls_ignorados=P
   dsc[0]: st=XXXXXXXX len=25 fcf=DC41 mseq=M dst=08 src=00 type=03 pseq=N
   ...
 ```
@@ -100,7 +101,9 @@ Motivos: `timeout/erro RX` (timeout HW de 5000 uus ou erro de RX — o
 tráfego a chegar), `valvula de descartes` (>16 frames — anómalo).
 Os dumps detalhados limitam-se aos primeiros 10 falhanços após boot; depois
 fica só a linha-resumo. Uma troca com sucesso após percalços imprime
-`(troca com D descartes, R reinicios)` a seguir ao `REPORT enviado`.
+`(troca com D descartes, P polls ignorados)` a seguir ao `REPORT enviado`.
+(O campo chamava-se `reinicios` antes do §6; a semântica mudou de "trocas
+reiniciadas" para "POLLs próprios ignorados durante a espera".)
 
 Leitura dos campos `dsc[]` (dst/src = byte baixo do endereço: anchors
 0x00-0x07, tag 0x08):
@@ -110,7 +113,7 @@ Leitura dos campos `dsc[]` (dst/src = byte baixo do endereço: anchors
 | `dst=00 src=08 type=03 pseq=N` (N = seq da troca) | é o FINAL a ser rejeitado → bug de validação no anchor; comparar campo a campo com `is_bitcraze_frame_for_me` |
 | `dst=00 src=08 type=03 pseq≠N` | FINAL com seq errado → dessincronização de seq entre POLL e FINAL (olhar lado do tag) |
 | `dst≠00 type=01` | POLLs para outros anchors → o tag nunca enviou o FINAL para nós; investigar aceitação do ANSWER no tag (timing da janela de RX do deck vs 1100 uus) |
-| `reinicios>0` frequente | o deck volta a fazer POLL a este anchor dentro da espera — confirma que o tag abandonou a troca anterior |
+| `polls_ignorados>0` frequente | o deck volta a fazer POLL a este anchor dentro da espera — confirma que o tag abandonou a troca anterior |
 | `status` com `RXSFDTO`/`RXPHE` (agora sem bits stale) | falha ao nível PHY na receção — com os bits limpos, o padrão por evento passa a ser fiável |
 
 ## 5. Alterações feitas (patch mínimo, sem tocar no ciclo TWR)
@@ -125,9 +128,44 @@ Tudo em `examples/ss_twr_resp/ss_resp_main.c`:
 3. `SYS_STATUS` capturado e impresso em **todos** os caminhos de falha;
    limpeza de bits stale (TX e good-RX) para statuses limpos por evento.
 4. Reinício imediato da troca quando chega POLL novo para este anchor
-   durante a espera do FINAL.
+   durante a espera do FINAL. **[REVERTIDO — ver §6.]**
 5. `ANCHOR_ID` 1 → 0 (board do banco).
 
 Intocado: FCF `0xDC41`, `dwt_config_t`/`main.c`, `RNG_DELAY_MS 1`, delays
 de 1100 uus, antenna delays, e a própria validação do FINAL (agora apenas
 observável).
+
+## 6. Race condition do reinício — CONFIRMADA no banco e corrigida
+
+A evidência de banco (89 ciclos) condenou o item 4 do §5 com correlação
+100%, sem exceções:
+
+```
+dup_then_reinicios1: 16      nodup_then_reinicios1: 0
+dup_then_reinicios0: 0       nodup_then_reinicios0: 44
+```
+
+`reinicios=1` ocorria sempre e só quando havia dois `ANSWER enviado`
+consecutivos sem outcome entre eles. Os 19 ANSWERs "engolidos" (89 enviados
+− 70 outcomes) eram exatamente os ciclos interrompidos pelo reinício: o
+branch fazia `break`+`continue` e servia o POLL novo **sem nunca logar o
+outcome do ciclo abandonado**. Além disso `discards` e o buffer `bc_diag`
+não eram limpos no reinício, contaminando as contagens e dumps do ciclo
+seguinte. (Não havia reset de rádio nenhum no reinício — o custo não era
+tempo, era estatística corrompida.)
+
+Correção em `bc_handle_twr_poll()`:
+
+- **Exclusão mútua de ciclo**: um POLL novo para este anchor durante a
+  espera do FINAL é agora **ignorado** — contado em `polls_ignorados` e
+  descartado como qualquer frame alheia. O ciclo em curso corre sempre até
+  um término logado.
+- O loop externo de reinício, `restart` e `restarts` desapareceram; a
+  função é single-pass: um POLL aceite → um ANSWER → exatamente um outcome
+  (`FINAL recebido` ou `FINAL falhou (...)`) — garantido por construção.
+- `tools/check_f3_log.py` verifica mecanicamente o critério de aceitação
+  (zero ANSWERs sem outcome) e produz a contagem-padrão sobre um dump RTT.
+
+Só depois de confirmar no banco **0 ciclos sem outcome** é que faz sentido
+avaliar se os `00806F02` restantes justificam alargar
+`FINAL_RX_TOTAL_WINDOW_UUS`.

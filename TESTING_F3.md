@@ -47,12 +47,26 @@ verificado com o setup real.
    Uma troca falhada imprime agora um bloco de diagnóstico:
 
    ```
-   FINAL falhou (<motivo>), seq=N, status=XXXXXXXX, descartadas=D, reinicios=R
+   FINAL falhou (<motivo>), seq=N, status=XXXXXXXX, descartadas=D, polls_ignorados=P
      dsc[0]: st=XXXXXXXX len=25 fcf=DC41 mseq=M dst=08 src=00 type=03 pseq=N
    ```
 
    A interpretação campo a campo está em `DIAG_F3.md` §4 — é essa tabela
    que discrimina a causa raiz na próxima sessão.
+
+   **Critério de aceitação da correção da race condition (`DIAG_F3.md` §6):
+   nunca dois `ANSWER enviado` consecutivos sem um outcome (`FINAL
+   recebido` ou `FINAL falhou`) entre eles.** Verificação mecânica sobre o
+   dump RTT gravado em ficheiro:
+
+   ```
+   python3 tools/check_f3_log.py rtt_dump.txt
+   ```
+
+   O script imprime a contagem-padrão (ANSWERs, FINALs recebidos, falhas
+   por motivo e por status, ciclos sem outcome) e sai com erro se algum
+   ANSWER tiver sido engolido. Aceita também logs antigos (campo
+   `reinicios=`) para comparação antes/depois.
 
 5. No cfclient → tab **Loco Positioning**: o anchor com o `ANCHOR_ID`
    flashado deve aparecer com **distância ≠ 0 que varia** quando o drone se
