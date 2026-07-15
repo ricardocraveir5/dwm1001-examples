@@ -16,6 +16,35 @@
 *           timestamps (poll RX, answer TX, final RX) and returns them in
 *           the REPORT payload. Distance is computed on the Crazyflie.
 *
+*           REV: hot-path minimization + timing diagnostics.
+*
+*           The 500-uus experiment failed with 100% "ANSWER dwt_starttx
+*           falhou" (HPDWARN: scheduled TX time already in the past when
+*           SYS_CTRL was written). Root cause: the CPU/SPI work between the
+*           POLL RX and dwt_starttx() exceeded the delay budget. Changes:
+*
+*           1. The ANSWER frame is pre-staged in the DW1000 TX buffer
+*              (dwt_writetxdata + dwt_writetxfctrl) BEFORE the POLL arrives.
+*              The hot path only patches the 1-byte payload seq and
+*              schedules the TX. This removes a 25-byte SPI write, the
+*              fctrl write and the header build from the critical section.
+*
+*           2. dwt_setrxaftertxdelay(0) moved to boot (register persists).
+*
+*           3. The REPORT frame is pre-staged during the FINAL wait (header,
+*              type/seq, pollRx, answerTx already known). On FINAL reception
+*              only the 5-byte finalRx field is patched in.
+*
+*           4. Timing diagnostics: latency from POLL RMARKER to just before
+*              dwt_starttx(), and margin to the scheduled TX time, printed
+*              in uus AFTER the outcome (never inside the critical section).
+*              Use these numbers to set the final delay = max(lat) + margin.
+*
+*           5. POLL_RX_TO_ANSWER_TX_DLY_UUS set to 800 as an INTERIM value:
+*              500 is proven below the firmware latency floor, 1100 is
+*              proven outside the tag's ~1 ms RX window. Tune from the
+*              measured "lat=" numbers, not by guessing.
+*
 * @attention
 *
 * Copyright 2018 (c) Decawave Ltd, Dublin, Ireland.
@@ -26,6 +55,7 @@
 #include "sdk_config.h"
 
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "FreeRTOS.h"
@@ -122,7 +152,7 @@ static uint8 tx_resp_msg[] = {
 /*
  * Expected Bitcraze/Loco IEEE 802.15.4 extended-address frame layout:
  *
- * byte 0-1   : FCF = 0x8841, little endian -> 0x41 0x88
+ * byte 0-1   : FCF = 0xDC41, little endian -> 0x41 0xDC
  * byte 2     : frame sequence number
  * byte 3-4   : PAN ID = 0xbccf, little endian -> 0xcf 0xbc
  * byte 5-12  : destination address, little endian
@@ -147,12 +177,26 @@ static uint8 tx_resp_msg[] = {
 /*
  * Bitcraze/Loco TWR timing.
  *
- * Delays from the HW RX timestamp of the incoming frame to the scheduled HW
- * TX time of the reply, in UWB microseconds. 1100 uus is the value already
- * proven safe for nRF/DWM1001 delayed TX in this project.
+ * Delays from the HW RX timestamp (RMARKER) of the incoming frame to the
+ * scheduled HW TX time of the reply, in UWB microseconds.
+ *
+ * Constraints, both hard:
+ *
+ *   FLOOR:   the anchor CPU/SPI work between the RX event and dwt_starttx()
+ *            must complete before the scheduled time, otherwise HPDWARN and
+ *            the TX is aborted ("ANSWER dwt_starttx falhou"). 500 uus is
+ *            proven BELOW the floor of the previous code (100% failure).
+ *
+ *   CEILING: the tag's TWR RX timeout is 1 ms (TWR_RECEIVE_TIMEOUT), armed
+ *            both for the ANSWER and for the REPORT. 1100 uus is proven
+ *            OUTSIDE this window (frames sent but ignored by the tag).
+ *
+ * 800 is an INTERIM value. Procedure: flash, read the "lat=" numbers from
+ * RTT (latency actually measured on this hot path), then set the delay to
+ * max(lat) + ~150 uus of margin, keeping it under ~850.
  */
-#define POLL_RX_TO_ANSWER_TX_DLY_UUS   1100
-#define FINAL_RX_TO_REPORT_TX_DLY_UUS  1100
+#define POLL_RX_TO_ANSWER_TX_DLY_UUS   800
+#define FINAL_RX_TO_REPORT_TX_DLY_UUS  800
 
 /*
  * RX timeout per rxenable while waiting for the FINAL after our ANSWER, in
@@ -178,6 +222,13 @@ static uint8 tx_resp_msg[] = {
  * loop terminates even if the deadline logic misbehaves.
  */
 #define BC_FINAL_MAX_DISCARDS          16
+
+/*
+ * dwt_readsystimestamphi32() and dwt_setdelayedtrxtime() use the top 32
+ * bits of the 40-bit device time, i.e. units of 256 device time units.
+ * 1 uus = 65536 DTU = 256 of these units.
+ */
+#define HI32_UNITS_PER_UUS             256
 
 /* ----------------------------------------------------------------------------
  * Diagnostics for the FINAL wait
@@ -223,6 +274,11 @@ typedef struct {
 #define BC_REPORT_FRAME_LEN  (BC_HEADER_LEN + 2 + \
                               sizeof(lpsTwrTagReportPayload_t) + BC_CRC_LEN)
 
+/* Offset of the finalRx field inside the DW1000 TX buffer, for the
+ * REPORT patch-in on the hot path. */
+#define BC_REPORT_FINALRX_OFFSET \
+  (BC_PAYLOAD_IDX + 2 + offsetof(lpsTwrTagReportPayload_t, finalRx))
+
 /* ----------------------------------------------------------------------------
  * Common variables
  * ----------------------------------------------------------------------------
@@ -251,8 +307,7 @@ static uint32 status_reg = 0;
 #define UUS_TO_DWT_TIME 65536
 
 /*
- * Delayed TX timing.
- * 1100 us is a safe starting value for nRF/DWM1001 operation.
+ * Delayed TX timing for the ORIGINAL Decawave example path only.
  */
 #define POLL_RX_TO_RESP_TX_DLY_UUS  1100
 
@@ -296,6 +351,8 @@ static int is_bitcraze_frame_for_me(const uint8 *buf, uint32 frame_len,
                                     uint8 type, uint8 seq);
 
 static void bc_build_header(uint8 *buf, uint8 mac_seq);
+static void bc_txbuf_patch(const uint8 *src, uint16 n, uint16 offset);
+static void bc_stage_answer(void);
 static void bc_handle_twr_poll(void);
 
 static void bc_diag_capture(uint32 status, uint32 frame_len, const uint8 *buf);
@@ -433,6 +490,9 @@ int ss_resp_run(void)
 
         /*
          * Write and send the response message.
+         *
+         * NOTE: this clobbers the pre-staged Bitcraze ANSWER frame in the
+         * DW1000 TX buffer; bc_stage_answer() is called again below.
          */
         tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
 
@@ -473,6 +533,9 @@ int ss_resp_run(void)
           /* Reset RX to properly reinitialise LDE operation. */
           dwt_rxreset();
         }
+
+        /* Restore the pre-staged Bitcraze ANSWER frame. */
+        bc_stage_answer();
       }
     }
   }
@@ -751,6 +814,39 @@ static void bc_build_header(uint8 *buf, uint8 mac_seq)
 }
 
 /*
+ * Patch n bytes into the DW1000 TX buffer at the given offset.
+ *
+ * dwt_writetxdata(txFrameLength, buf, offset) writes (txFrameLength - 2)
+ * bytes: the API models the trailing 2-byte CRC that the DW1000 appends by
+ * itself. Hence the +BC_CRC_LEN here.
+ */
+static void bc_txbuf_patch(const uint8 *src, uint16 n, uint16 offset)
+{
+  dwt_writetxdata((uint16)(n + BC_CRC_LEN), (uint8 *)src, offset);
+}
+
+/*
+ * Pre-stage the ANSWER frame in the DW1000 TX buffer and program the TX
+ * frame control for its length, so that when a POLL arrives the hot path
+ * only has to patch the 1-byte payload seq and schedule the TX.
+ *
+ * The MAC sequence number is fixed at 0: lpsTwrTag.c matches the ANSWER by
+ * payload type/seq and addresses only, never by MAC seq.
+ *
+ * Must be called whenever the TX buffer or fctrl were used for anything
+ * else (REPORT, legacy Decawave response) and once at boot.
+ */
+static void bc_stage_answer(void)
+{
+  bc_build_header(bc_tx_frame, 0);
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_ANSWER;
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = 0;
+
+  dwt_writetxdata(BC_ANSWER_FRAME_LEN, bc_tx_frame, 0);
+  dwt_writetxfctrl(BC_ANSWER_FRAME_LEN, 0, 1);
+}
+
+/*
  * Capture one frame discarded during the FINAL wait. Pure memory copy — no
  * RTT traffic — so it is safe inside the TWR timing windows. The captured
  * frames are printed later by bc_diag_dump(), after the exchange has failed.
@@ -837,9 +933,12 @@ static void bc_diag_dump(const char *reason, uint8 seq, uint32 last_status,
  * while the FINAL is pending is ignored (counted in polls_ignorados), never
  * served, so exchanges cannot overlap and no outcome is ever swallowed.
  *
- * Timing note: the ANSWER must go on air POLL_RX_TO_ANSWER_TX_DLY_UUS after
- * the POLL RX timestamp, so everything up to dwt_starttx() is time critical
- * and must not be interleaved with RTT logging.
+ * HOT PATH (POLL RX -> ANSWER dwt_starttx): the ANSWER frame and its fctrl
+ * are already staged in the DW1000 (bc_stage_answer()), and
+ * dwt_setrxaftertxdelay(0) is programmed once at boot. The remaining SPI
+ * traffic is: RX timestamp read, delayed-time write, 1-byte seq patch,
+ * RX timeout arm, systime read (diagnostics), SYS_CTRL write. Nothing else
+ * may be added here, and no RTT logging before dwt_starttx() returns.
  */
 static void bc_handle_twr_poll(void)
 {
@@ -848,6 +947,9 @@ static void bc_handle_twr_poll(void)
   uint32 report_tx_time;
   uint32 final_deadline;
   uint32 frame_len;
+  uint32 t_pre;
+  int32_t lat_uus;
+  int32_t margin_uus;
   int discards;
   int own_polls_ignored;
   int ret;
@@ -879,30 +981,41 @@ static void bc_handle_twr_poll(void)
   bc_answer_tx_ts =
       (((uint64)(answer_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
 
-  bc_build_header(bc_tx_frame, frame_seq_nb);
-  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_ANSWER;
-  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
-
-  dwt_writetxdata(BC_ANSWER_FRAME_LEN, bc_tx_frame, 0);
-  dwt_writetxfctrl(BC_ANSWER_FRAME_LEN, 0, 1);
+  /*
+   * The ANSWER frame is already staged in the DW1000 TX buffer; only the
+   * payload seq byte changes between exchanges.
+   */
+  bc_txbuf_patch(&lps_seq, 1, BC_PAYLOAD_IDX + LPS_TWR_SEQ);
 
   /*
-   * Re-arm the receiver in hardware right after the ANSWER so the FINAL
-   * is caught, with a timeout so a lost FINAL cannot block the anchor.
+   * Arm the RX timeout for the FINAL wait; RX auto-enable after TX is
+   * programmed once at boot (dwt_setrxaftertxdelay(0)).
    */
-  dwt_setrxaftertxdelay(0);
   dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
 
+  /*
+   * Timing diagnostics: capture "now" just before dwt_starttx(). Printed
+   * only after the outcome. hi32 units: 1 uus = 256 units.
+   */
+  t_pre = dwt_readsystimestamphi32();
+
   ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+
+  lat_uus = (int32_t)(t_pre - (uint32)(bc_poll_rx_ts >> 8)) /
+            HI32_UNITS_PER_UUS;
+  margin_uus = (int32_t)(answer_tx_time - t_pre) / HI32_UNITS_PER_UUS;
 
   if (ret != DWT_SUCCESS)
   {
     /*
-     * The ANSWER TX window was missed (e.g. delayed by logging or the
-     * scheduler). Abandon this exchange and go back to waiting for POLLs.
+     * The ANSWER TX window was missed (HPDWARN: scheduled time already in
+     * the past). lat tells how long the hot path actually took from the
+     * POLL RMARKER; margin is how late (negative) the schedule was.
      */
-    DBG("ERRO: ANSWER dwt_starttx falhou, seq=%u\r\n",
-        (unsigned int)lps_seq);
+    DBG("ERRO: ANSWER dwt_starttx falhou, seq=%u, lat=%d uus, margem=%d uus\r\n",
+        (unsigned int)lps_seq,
+        (int)lat_uus,
+        (int)margin_uus);
 
     dwt_forcetrxoff();
     dwt_rxreset();
@@ -930,9 +1043,35 @@ static void bc_handle_twr_poll(void)
    */
   dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX);
 
-  DBG("ANSWER enviado, anchor=%u, seq=%u\r\n",
+  DBG("ANSWER enviado, anchor=%u, seq=%u, lat=%d uus, margem=%d uus\r\n",
       (unsigned int)ANCHOR_ID,
-      (unsigned int)lps_seq);
+      (unsigned int)lps_seq,
+      (int)lat_uus,
+      (int)margin_uus);
+
+  /* --------------------------------------------------------------------
+   * Pre-stage the REPORT while waiting for the FINAL.
+   *
+   * Header, type/seq, pollRx and answerTx are already known; only the
+   * 5-byte finalRx field will be patched in on the hot path after the
+   * FINAL arrives. The RX side is armed in hardware, so any frame that
+   * arrives meanwhile is buffered by the DW1000 — nothing is lost.
+   * --------------------------------------------------------------------
+   */
+  memset(&report, 0, sizeof(report));
+  ts_to_bytes40(report.pollRx, bc_poll_rx_ts);
+  ts_to_bytes40(report.answerTx, bc_answer_tx_ts);
+  report.pressure = 0.0f;
+  report.asl = 0.0f;
+  report.pressure_ok = 0;
+
+  bc_build_header(bc_tx_frame, frame_seq_nb);
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_REPORT;
+  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
+  memcpy(&bc_tx_frame[BC_PAYLOAD_IDX + 2], &report, sizeof(report));
+
+  dwt_writetxdata(BC_REPORT_FRAME_LEN, bc_tx_frame, 0);
+  dwt_writetxfctrl(BC_REPORT_FRAME_LEN, 0, 1);
 
   /* --------------------------------------------------------------------
    * FINAL — wait for the tag's FINAL for this exchange.
@@ -955,6 +1094,8 @@ static void bc_handle_twr_poll(void)
 
       bc_diag_dump("timeout/erro RX", lps_seq, status_reg,
                    discards, own_polls_ignored);
+
+      bc_stage_answer();
       return;
     }
 
@@ -1002,6 +1143,8 @@ static void bc_handle_twr_poll(void)
       dwt_setrxtimeout(0);
       bc_diag_dump("janela esgotada", lps_seq, status_reg,
                    discards, own_polls_ignored);
+
+      bc_stage_answer();
       return;
     }
 
@@ -1010,6 +1153,8 @@ static void bc_handle_twr_poll(void)
       dwt_setrxtimeout(0);
       bc_diag_dump("valvula de descartes", lps_seq, status_reg,
                    discards, own_polls_ignored);
+
+      bc_stage_answer();
       return;
     }
 
@@ -1018,6 +1163,9 @@ static void bc_handle_twr_poll(void)
 
   /* --------------------------------------------------------------------
    * REPORT — time critical section (no logging until dwt_starttx()).
+   *
+   * The REPORT frame is already staged in the DW1000 TX buffer; only the
+   * 5-byte finalRx field is patched in here.
    * --------------------------------------------------------------------
    */
   bc_final_rx_ts = get_rx_timestamp_u64();
@@ -1028,33 +1176,32 @@ static void bc_handle_twr_poll(void)
 
   dwt_setdelayedtrxtime(report_tx_time);
 
-  memset(&report, 0, sizeof(report));
-  ts_to_bytes40(report.pollRx, bc_poll_rx_ts);
-  ts_to_bytes40(report.answerTx, bc_answer_tx_ts);
-  ts_to_bytes40(report.finalRx, bc_final_rx_ts);
-  report.pressure = 0.0f;
-  report.asl = 0.0f;
-  report.pressure_ok = 0;
+  {
+    uint8 finalrx_bytes[5];
 
-  bc_build_header(bc_tx_frame, frame_seq_nb);
-  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_TYPE] = LPS_TWR_REPORT;
-  bc_tx_frame[BC_PAYLOAD_IDX + LPS_TWR_SEQ]  = lps_seq;
-  memcpy(&bc_tx_frame[BC_PAYLOAD_IDX + 2], &report, sizeof(report));
+    ts_to_bytes40(finalrx_bytes, bc_final_rx_ts);
+    bc_txbuf_patch(finalrx_bytes, 5, BC_REPORT_FINALRX_OFFSET);
+  }
 
-  dwt_writetxdata(BC_REPORT_FRAME_LEN, bc_tx_frame, 0);
-  dwt_writetxfctrl(BC_REPORT_FRAME_LEN, 0, 1);
+  t_pre = dwt_readsystimestamphi32();
 
   ret = dwt_starttx(DWT_START_TX_DELAYED);
+
+  margin_uus = (int32_t)(report_tx_time - t_pre) / HI32_UNITS_PER_UUS;
 
   DBG("FINAL recebido, seq=%u\r\n", (unsigned int)lps_seq);
 
   if (ret != DWT_SUCCESS)
   {
-    DBG("ERRO: REPORT dwt_starttx falhou, seq=%u\r\n", (unsigned int)lps_seq);
+    DBG("ERRO: REPORT dwt_starttx falhou, seq=%u, margem=%d uus\r\n",
+        (unsigned int)lps_seq,
+        (int)margin_uus);
 
     dwt_forcetrxoff();
     dwt_rxreset();
     dwt_setrxtimeout(0);
+
+    bc_stage_answer();
     return;
   }
 
@@ -1064,9 +1211,10 @@ static void bc_handle_twr_poll(void)
 
   dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
 
-  DBG("REPORT enviado, anchor=%u, seq=%u\r\n",
+  DBG("REPORT enviado, anchor=%u, seq=%u, margem=%d uus\r\n",
       (unsigned int)ANCHOR_ID,
-      (unsigned int)lps_seq);
+      (unsigned int)lps_seq,
+      (int)margin_uus);
 
   if (discards > 0 || own_polls_ignored > 0)
   {
@@ -1078,6 +1226,9 @@ static void bc_handle_twr_poll(void)
 
   /* Back to waiting for POLLs with no RX timeout. */
   dwt_setrxtimeout(0);
+
+  /* Re-stage the ANSWER for the next POLL (TX buffer holds the REPORT). */
+  bc_stage_answer();
 }
 
 /* ----------------------------------------------------------------------------
@@ -1102,8 +1253,22 @@ void ss_responder_task_function(void * pvParameter)
   DBG("DWM1001 SS RESPONDER DEBUG START\r\n");
   DBG("ANCHOR_ID=%u\r\n", (unsigned int)ANCHOR_ID);
   DBG("MY_ADDRESS anchor base + id\r\n");
+  DBG("ANSWER dly=%u uus, REPORT dly=%u uus\r\n",
+      (unsigned int)POLL_RX_TO_ANSWER_TX_DLY_UUS,
+      (unsigned int)FINAL_RX_TO_REPORT_TX_DLY_UUS);
   DBG("Waiting for UWB frames...\r\n");
   DBG("========================================\r\n");
+
+  /*
+   * One-time DW1000 programming for the hot path. Assumes main() has
+   * already run dwt_initialise()/dwt_configure() before starting this task
+   * (true in the stock dwm1001-examples main).
+   *
+   * - RX auto-enable immediately after any TX (RESPONSE_EXPECTED).
+   * - ANSWER frame + fctrl staged in the TX buffer.
+   */
+  dwt_setrxaftertxdelay(0);
+  bc_stage_answer();
 
   while (true)
   {
@@ -1138,7 +1303,7 @@ void ss_responder_task_function(void * pvParameter)
 *    RTT shows one line per state transition:
 *
 *      ANSWER enviado...
-*      FINAL recebido...   (or FINAL timeout/erro...)
+*      FINAL recebido...   (or FINAL falhou...)
 *      REPORT enviado...
 *
 *    The anchor never computes distance; it returns the three 40-bit HW
@@ -1152,5 +1317,23 @@ void ss_responder_task_function(void * pvParameter)
 *
 *    If this appears while using another DWM1001 with ss_twr_init, the original
 *    Decawave ranging example is working.
+*
+* 4. Hot-path minimization (this revision): the ANSWER (and later the
+*    REPORT) frames are pre-staged in the DW1000 TX buffer outside the
+*    timing-critical sections; the hot paths only patch the bytes that
+*    change (payload seq / finalRx) and schedule the delayed TX.
+*
+* 5. Timing diagnostics (this revision): every ANSWER outcome logs
+*
+*      lat    = uus elapsed from the POLL RMARKER to just before
+*               dwt_starttx() — the real latency floor of this firmware;
+*      margem = uus remaining until the scheduled TX time (negative when
+*               the window was missed).
+*
+*    Tuning procedure: read lat over ~1 min of traffic, then set
+*    POLL_RX_TO_ANSWER_TX_DLY_UUS = max(lat) + ~150, keeping the total
+*    under ~850 uus so the ANSWER lands inside the tag's 1 ms RX window.
+*    The acceptance criterion remains tag-side: twr.rangingSuccessRate0 in
+*    cfclient, not anchor-side prints.
 *
 ****************************************************************************************************************************************************/
